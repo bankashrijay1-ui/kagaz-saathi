@@ -1,0 +1,253 @@
+"""Kagaz Saathi server. Python standard library only (no ARM64 wheel problems).
+Serves the UI, masks personal data, streams from a LOCAL OpenAI-compatible LLM
+server (e.g. GenieX on the Snapdragon NPU), and logs latency for benchmarking.
+"""
+import json, os, re, sys, threading, time, urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+LLM_URL = os.environ.get("LLM_URL", "http://127.0.0.1:8080/v1").rstrip("/")
+LLM_MODEL = os.environ.get("LLM_MODEL", "local-model")
+BACKEND = os.environ.get("BACKEND_LABEL", "unlabelled")  # e.g. NPU-GenieX-Qwen3-4B
+PORT = int(os.environ.get("PORT", "5000"))
+INDEX_HTML = r'''<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kagaz Saathi (कागज़ साथी)</title>
+<style>
+:root{--ink:#16233b;--paper:#f2f5f8;--panel:#fff;--line:#c9d3df;--mask:#16233b;--ok:#0f766e;--warn:#a16207;--muted:#5b6b80}
+@media (prefers-color-scheme:dark){:root{--ink:#e6edf6;--paper:#0f1724;--panel:#172236;--line:#2b3b55;--mask:#e6edf6;--ok:#5eead4;--warn:#fbbf24;--muted:#93a4bb}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--paper);color:var(--ink);font:16px/1.6 "Segoe UI","Nirmala UI",system-ui,sans-serif}
+header{padding:20px clamp(16px,4vw,48px);border-bottom:1px solid var(--line);display:flex;flex-wrap:wrap;gap:8px 24px;align-items:baseline}
+h1{margin:0;font-size:1.6rem}
+header p{margin:0;color:var(--muted);max-width:60ch}
+main{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr));gap:20px;padding:20px clamp(16px,4vw,48px)}
+section{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:16px;min-width:0}
+h2{margin:0 0 8px;font-size:1.05rem}
+textarea{width:100%;min-height:200px;padding:10px;border:1px solid var(--line);border-radius:4px;background:transparent;color:inherit;font:inherit;resize:vertical}
+.row{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0;align-items:center}
+button,select{font:inherit;padding:8px 14px;border-radius:4px;border:1px solid var(--ink);background:transparent;color:var(--ink);cursor:pointer}
+button.primary{background:var(--ink);color:var(--paper)}
+button:disabled{opacity:.5;cursor:wait}
+:focus-visible{outline:3px solid var(--ok);outline-offset:2px}
+#preview{white-space:pre-wrap;word-break:break-word;border-left:4px solid var(--ok);padding:6px 12px;min-height:64px;color:var(--muted)}
+#preview mark{background:var(--mask);color:var(--paper);padding:0 4px;border-radius:2px}
+#out{white-space:pre-wrap;min-height:160px}
+.err{color:var(--warn)}
+.stats{display:flex;flex-wrap:wrap;gap:6px 20px;color:var(--muted);font-size:.9rem}
+.stats b{color:var(--ink)}
+table{width:100%;border-collapse:collapse;font-size:.85rem;display:block;overflow-x:auto}
+td,th{padding:4px 10px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}
+footer{padding:0 clamp(16px,4vw,48px) 24px;color:var(--muted);font-size:.85rem}
+</style>
+</head>
+<body>
+<header>
+  <h1>Kagaz Saathi · कागज़ साथी</h1>
+  <p>Understand a notice, policy or report in your own language. Runs on this PC. Nothing is uploaded.</p>
+</header>
+<main>
+  <section aria-labelledby="h-in">
+    <h2 id="h-in">Your document</h2>
+    <textarea id="doc" aria-label="Document text" placeholder="Paste the text of your notice, policy, agreement or lab report here."></textarea>
+    <div class="row">
+      <select id="lang" aria-label="Explain in"><option value="hi">हिन्दी</option><option value="hinglish">Hinglish</option><option value="en">English</option></select>
+      <button class="primary" id="go">Explain this document</button>
+      <button id="sample">Load sample</button>
+    </div>
+    <h2>What the AI will see</h2>
+    <div id="preview" aria-live="polite">Personal numbers are hidden here before the AI reads anything.</div>
+  </section>
+  <section aria-labelledby="h-out">
+    <h2 id="h-out">Explanation</h2>
+    <div id="out" aria-live="polite"></div>
+    <div class="row"><button id="speak" disabled>Read aloud</button><button id="stop" disabled>Stop</button></div>
+    <div class="stats" id="stats"></div>
+  </section>
+  <section aria-labelledby="h-dev" style="grid-column:1/-1">
+    <h2 id="h-dev">This device</h2>
+    <div class="stats" id="dev">Checking local model…</div>
+    <table id="bench"><thead><tr><th>Backend</th><th>First word (ms)</th><th>Tokens/s</th><th>Tokens</th><th>Masked items</th></tr></thead><tbody></tbody></table>
+  </section>
+</main>
+<footer>Information only, not legal, tax or medical advice. Check important decisions with a professional.</footer>
+<script>
+const $=id=>document.getElementById(id);
+const SAMPLE=`NOTICE UNDER SECTION 143(1)\nAssessee: Ramesh Kumar, PAN ABCDE1234F, Aadhaar 1234 5678 9012\nMobile 9876543210, email ramesh@example.com\nAssessment Year 2025-26. Total income declared: Rs 6,40,000. Income computed: Rs 7,05,000.\nA demand of Rs 18,420 is payable on or before 30 November 2026, failing which interest under Section 220(2) at 1% per month will apply.\nIf you disagree, file a response on the e-filing portal within 30 days of this intimation.`;
+let last="",t;
+async function post(u,b){return fetch(u,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)})}
+async function preview(){
+  const text=$("doc").value;
+  if(!text.trim()){$("preview").textContent="Personal numbers are hidden here before the AI reads anything.";return}
+  const r=await (await post("/api/redact",{text})).json();
+  const p=$("preview");p.textContent="";
+  r.text.split(/(\[[A-Z]+\])/).forEach(s=>{if(/^\[[A-Z]+\]$/.test(s)){const m=document.createElement("mark");m.textContent=s;p.append(m)}else p.append(s)});
+}
+$("doc").addEventListener("input",()=>{clearTimeout(t);t=setTimeout(preview,300)});
+$("sample").onclick=()=>{$("doc").value=SAMPLE;preview()};
+$("go").onclick=async()=>{
+  const text=$("doc").value.trim();if(!text)return;
+  $("go").disabled=true;$("out").textContent="";$("out").classList.remove("err");$("stats").textContent="";last="";
+  try{
+    const res=await post("/api/explain",{text,lang:$("lang").value});
+    const rd=res.body.getReader(),dec=new TextDecoder();let buf="";
+    for(;;){
+      const {done,value}=await rd.read();if(done)break;
+      buf+=dec.decode(value,{stream:true});const lines=buf.split("\n");buf=lines.pop();
+      for(const l of lines){
+        if(!l.startsWith("data:")||l.includes("[DONE]"))continue;
+        let j;try{j=JSON.parse(l.slice(5))}catch{continue}
+        if(j.kc_error){$("out").textContent=j.kc_error;$("out").classList.add("err")}
+        else if(j.kc_stats){const s=j.kc_stats;$("stats").innerHTML=`First word <b>${s.ttft_ms} ms</b> · <b>${s.tps}</b> tokens/s · backend <b>${s.backend}</b>`;loadBench()}
+        else{const c=j.choices&&j.choices[0]&&j.choices[0].delta&&j.choices[0].delta.content;if(c){last+=c;$("out").textContent=last.replace(/<think>[\s\S]*?<\/think>/g,"")}}
+      }
+    }
+  }catch(e){$("out").textContent="Server not reachable: "+e;$("out").classList.add("err")}
+  $("go").disabled=false;$("speak").disabled=!last;
+};
+$("speak").onclick=()=>{speechSynthesis.cancel();const u=new SpeechSynthesisUtterance($("out").textContent);u.lang=$("lang").value==="hi"?"hi-IN":"en-IN";speechSynthesis.speak(u);$("stop").disabled=false};
+$("stop").onclick=()=>speechSynthesis.cancel();
+async function loadBench(){
+  try{
+    const h=await (await fetch("/api/health")).json();
+    $("dev").textContent=h.ok?`Local model reachable · backend: ${h.backend} · ${h.url}`:`Local model NOT reachable at ${h.url}. Start it, then reload.`;
+    const b=await (await fetch("/api/bench")).json();
+    const tb=$("bench").querySelector("tbody");tb.textContent="";
+    b.rows.slice().reverse().forEach(r=>{const tr=tb.insertRow();[r.backend,r.ttft_ms,r.tps,r.tokens,Object.values(r.masked||{}).reduce((a,c)=>a+c,0)].forEach(v=>tr.insertCell().textContent=v)});
+  }catch(e){$("dev").textContent="Server not reachable."}
+}
+loadBench();
+</script>
+</body>
+</html>
+'''
+HERE = os.path.dirname(os.path.abspath(__file__))
+LOG = os.path.join(HERE, "bench.jsonl")
+
+PATTERNS = [  # order matters: longer/specific first
+    ("AADHAAR", r"\b\d{4}[ -]?\d{4}[ -]?\d{4}\b"),
+    ("PAN", r"\b[A-Z]{5}\d{4}[A-Z]\b"),
+    ("EMAIL", r"[\w.+-]+@[\w-]+\.[\w.-]+"),
+    ("PHONE", r"(?:\+91[ -]?)?\b[6-9]\d{9}\b"),
+    ("ACCOUNT", r"\b\d{9,18}\b"),
+]
+
+def redact(text):
+    counts = {}
+    for name, pat in PATTERNS:
+        text, n = re.subn(pat, "[%s]" % name, text)
+        if n:
+            counts[name] = n
+    return text, counts
+
+LANGS = {"hi": "simple Hindi (Devanagari)", "en": "simple English",
+         "hinglish": "Hinglish (Hindi in Roman script)"}
+
+def system_prompt(lang):
+    return ("You help ordinary people in India understand official documents "
+            "(tax and bank notices, insurance, rent agreements, lab reports). "
+            "Reply in %s, at a Class 8 reading level, with exactly these headings: "
+            "1) Yeh kya hai / What this is  2) Important dates and amounts  "
+            "3) What you must do  4) Warning signs. "
+            "Tokens like [AADHAAR] or [PAN] are masked on purpose; never guess them. "
+            "Only use facts present in the document. If unsure, say so. "
+            "You are not a lawyer; suggest a professional for high-stakes decisions."
+            % LANGS.get(lang, LANGS["en"]))
+
+class H(BaseHTTPRequestHandler):
+    def _json(self, obj, code=200):
+        b = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
+
+    def _body(self):
+        return json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
+
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        if self.path in ("/", "/index.html"):
+            b = INDEX_HTML.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+        elif self.path == "/api/bench":
+            rows = []
+            if os.path.exists(LOG):
+                rows = [json.loads(l) for l in open(LOG, encoding="utf-8") if l.strip()]
+            self._json({"backend": BACKEND, "model": LLM_MODEL, "rows": rows[-20:]})
+        elif self.path == "/api/health":
+            try:
+                urllib.request.urlopen(LLM_URL + "/models", timeout=3)
+                self._json({"ok": True, "backend": BACKEND, "url": LLM_URL})
+            except Exception as e:
+                self._json({"ok": False, "backend": BACKEND, "url": LLM_URL, "error": str(e)})
+        else:
+            self.send_error(404)
+
+    def do_POST(self):
+        d = self._body()
+        text, counts = redact(d.get("text", ""))
+        if self.path == "/api/redact":
+            return self._json({"text": text, "counts": counts})
+        if self.path != "/api/explain":
+            return self.send_error(404)
+        payload = {"model": LLM_MODEL, "stream": True, "temperature": 0.3, "max_tokens": 700,
+                   "messages": [{"role": "system", "content": system_prompt(d.get("lang", "en"))},
+                                {"role": "user", "content": text[:6000]}]}
+        req = urllib.request.Request(LLM_URL + "/chat/completions", json.dumps(payload).encode(),
+                                     {"Content-Type": "application/json"})
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        t0, ttft, n = time.perf_counter(), None, 0
+        try:
+            with urllib.request.urlopen(req, timeout=120) as r:
+                for line in r:
+                    if line.startswith(b"data:") and b"[DONE]" not in line:
+                        if ttft is None:
+                            ttft = time.perf_counter() - t0
+                        n += 1  # one SSE chunk is roughly one token
+                    self.wfile.write(line)
+                    self.wfile.flush()
+            dur = time.perf_counter() - t0
+            gen = max(dur - (ttft or 0), 1e-6)
+            stats = {"backend": BACKEND, "model": LLM_MODEL, "ttft_ms": round((ttft or 0) * 1000),
+                     "tokens": n, "tps": round(n / gen, 1), "chars_in": len(text),
+                     "masked": counts, "ts": int(time.time())}
+            open(LOG, "a", encoding="utf-8").write(json.dumps(stats) + "\n")
+            self.wfile.write(("data: " + json.dumps({"kc_stats": stats}) + "\n\n").encode())
+        except Exception as e:
+            err = {"kc_error": "Could not reach the local model at %s (%s). Start it first." % (LLM_URL, e)}
+            self.wfile.write(("data: " + json.dumps(err) + "\n\n").encode())
+
+
+# ---- Built-in fake LLM so you can check the whole app without GenieX: python kagaz_saathi.py --mock
+class Mock(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        b = b'{"data":[{"id":"mock"}]}'
+        self.send_response(200); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
+        for w in "1) What this is: a tax notice. 2) Amounts: pay Rs 18,420 by 30 Nov 2026. 3) Do: file a response within 30 days. 4) Warning: interest of 1% per month. [MOCK OUTPUT, not a real model]".split(" "):
+            time.sleep(0.03)
+            self.wfile.write(("data: " + json.dumps({"choices": [{"delta": {"content": w + " "}}]}) + "\n\n").encode()); self.wfile.flush()
+        self.wfile.write(b"data: [DONE]\n\n")
+
+if __name__ == "__main__":
+    if "--mock" in sys.argv:
+        threading.Thread(target=ThreadingHTTPServer(("127.0.0.1", 8081), Mock).serve_forever, daemon=True).start()
+        LLM_URL, BACKEND = "http://127.0.0.1:8081/v1", "MOCK (fake model, not a real benchmark)"
+    print("Kagaz Saathi on http://127.0.0.1:%d | LLM %s | backend %s" % (PORT, LLM_URL, BACKEND))
+    ThreadingHTTPServer(("127.0.0.1", PORT), H).serve_forever()
